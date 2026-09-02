@@ -16,12 +16,13 @@ Minimal FastAPI service for the OIDC demo apps, alongside `mock-oidc-provider`:
 
 ```bash
 cd /home/le-thi-ha-linh/Code/decode-service
-uv venv .venv --python 3.12
-source .venv/bin/activate
-uv pip install -r requirements.txt
+uv sync
 cp .env.example .env
-uvicorn main:app --reload --port 8000
+uv run uvicorn main:app --reload --port 8000
 ```
+
+`uv sync` creates `.venv` and installs the runtime deps plus the `dev`
+dependency group (use `uv sync --no-dev` for runtime only).
 
 The service listens on `http://localhost:8000`. `mock-oidc-provider` must be
 running on `http://localhost:4000` so its JWKS can be fetched.
@@ -29,8 +30,7 @@ running on `http://localhost:4000` so its JWKS can be fetched.
 ## Test
 
 ```bash
-uv pip install -r requirements-dev.txt
-pytest
+uv run pytest
 ```
 
 ## Environment variables

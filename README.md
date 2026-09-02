@@ -5,12 +5,16 @@ Minimal FastAPI service for the OIDC demo apps, alongside `mock-oidc-provider`:
 - `POST /decode` — verifies an OIDC `id_token` (JWT, **RS256**) against
   `mock-oidc-provider`'s JWKS endpoint and returns its decoded claims as JSON.
   Used by `react-login`'s public flow and available standalone.
-- `POST /token` — a **confidential token-exchange proxy** for
-  `react-login`'s "confidential client via backend" flow: it injects the
-  `client_secret` server-side, forwards the `authorization_code` exchange to
-  `mock-oidc-provider`, then decodes the returned `id_token` (same logic as
-  `/decode`) and returns the tokens **plus** a `claims` object. The browser
-  never sees the secret.
+- `POST /token` — a **confidential token-exchange proxy** used by both
+  `react-login`'s "confidential client via backend" flow and `next-login`'s
+  `/callback`: it injects the `client_secret` server-side, forwards the
+  `authorization_code` exchange to `mock-oidc-provider`, then decodes the
+  returned `id_token` (same logic as `/decode`) and returns the tokens **plus**
+  a `claims` object. The caller never sees the secret. Accepts a JSON body
+  `{ "code", "code_verifier", "redirect_uri" }` (as sent by `request-oauth2`'s
+  `exchangeCodeForTokenViaBackend`) or a form-urlencoded OAuth2 body. The
+  confidential client is resolved from `redirect_uri` via `OIDC_TOKEN_CLIENTS`,
+  so one running instance serves both demo apps.
 
 ## Run locally
 
@@ -40,8 +44,9 @@ uv run pytest
 | `OIDC_JWKS_URL` | `http://localhost:4000/jwks` | Where to fetch RSA public keys |
 | `OIDC_ISSUER` | `http://localhost:4000` | Expected `iss` claim |
 | `OIDC_TOKEN_URL` | `http://localhost:4000/token` | Upstream token endpoint for `POST /token` |
-| `OIDC_CLIENT_ID` | `react-login-confidential` | Confidential client id the proxy authenticates as |
-| `OIDC_CLIENT_SECRET` | `react-login-dev-secret-do-not-use-in-prod` | Secret injected by `POST /token` (never leaves the server) |
+| `OIDC_CLIENT_ID` | `react-login-confidential` | Fallback confidential client id (when a `redirect_uri` is not in `OIDC_TOKEN_CLIENTS`) |
+| `OIDC_CLIENT_SECRET` | `react-login-dev-secret-do-not-use-in-prod` | Fallback secret injected by `POST /token` (never leaves the server) |
+| `OIDC_TOKEN_CLIENTS` | `{}` | JSON map `redirect_uri → { client_id, client_secret }`; lets one instance serve multiple confidential clients. See `.env.example`. |
 
 ## Routes
 
@@ -52,15 +57,19 @@ uv run pytest
   `{"detail": "Invalid or expired token"}` for an invalid, tampered, or expired
   token, or one signed with any algorithm other than RS256. **Unchanged** — the
   verify/decode logic is now a `decode_id_token()` helper shared with `POST /token`.
-- `POST /token` — confidential token-exchange proxy. Accepts the same
-  `application/x-www-form-urlencoded` `authorization_code` body an OAuth2 token
-  endpoint does (`grant_type`, `redirect_uri`, `code`, `code_verifier`), sets
-  `client_id` + `client_secret` from the env vars above, and forwards to
-  `OIDC_TOKEN_URL`. On success it also decodes the returned `id_token` and
-  responds with the token JSON **plus** a `claims` object. An upstream OAuth2
-  error (e.g. `400 invalid_grant`, `401 invalid_client`) is passed through with
-  its status; `502` if the exchange succeeds but the `id_token` is missing or
-  fails verification.
+- `POST /token` — confidential token-exchange proxy. Accepts either a JSON body
+  `{ "code", "code_verifier", "redirect_uri" }` (as sent by `request-oauth2`'s
+  `exchangeCodeForTokenViaBackend`) or an `application/x-www-form-urlencoded`
+  `authorization_code` body (`grant_type`, `redirect_uri`, `code`,
+  `code_verifier`). `grant_type` defaults to `authorization_code`; `client_id` +
+  `client_secret` are resolved from `redirect_uri` (via `OIDC_TOKEN_CLIENTS`,
+  falling back to `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`) and forwarded to
+  `OIDC_TOKEN_URL`. Missing `code` / `code_verifier` / `redirect_uri` → `400`. On
+  success it also decodes the returned `id_token` and responds with the token
+  JSON **plus** a `claims` object. An upstream OAuth2 error (e.g.
+  `400 invalid_grant`, `401 invalid_client`) is passed through with its status;
+  `502` if the exchange succeeds but the `id_token` is missing or fails
+  verification.
 
 `PyJWKClient` caches keys and refetches when it sees a new `kid`, so a
 `mock-oidc-provider` restart with a fresh key is picked up automatically.
@@ -138,6 +147,17 @@ curl -s -X POST http://localhost:8000/token \
   --data-urlencode "code_verifier=$V"
 ```
 
+Or send the JSON body shape (what `exchangeCodeForTokenViaBackend` uses) — no
+`grant_type`, no `client_id`:
+
+```bash
+curl -s -X POST http://localhost:8000/token \
+  -H "Content-Type: application/json" \
+  -d "{\"code\": \"$CODE\", \"code_verifier\": \"$V\", \"redirect_uri\": \"http://localhost:5173/callback\"}"
+```
+
 Expected: `200` with `access_token`, `id_token`, … **and** a `claims` object.
 Dropping `code_verifier` makes `mock-oidc-provider` return `400 invalid_grant`
 (PKCE is enforced for every client), which the proxy passes straight through.
+Using `redirect_uri=http://localhost:3000/callback` resolves the
+`next-login-confidential` client instead (see `OIDC_TOKEN_CLIENTS`).

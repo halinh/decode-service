@@ -1,3 +1,4 @@
+import json
 import os
 from urllib.parse import parse_qsl
 
@@ -18,14 +19,32 @@ load_dotenv()
 OIDC_JWKS_URL = os.environ.get("OIDC_JWKS_URL", "http://localhost:4000/jwks")
 OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "http://localhost:4000")
 
-# Confidential token-exchange proxy config (POST /token). Lets react-login's
-# browser run request-oauth2's exchangeCodeForToken normally while the
-# client_secret stays server-side.
+# Confidential token-exchange proxy config (POST /token). Lets a browser SPA
+# (react-login) or a server route (next-login) run the authorization_code
+# exchange without ever holding the client_secret — it stays here.
 OIDC_TOKEN_URL = os.environ.get("OIDC_TOKEN_URL", "http://localhost:4000/token")
 OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "react-login-confidential")
 OIDC_CLIENT_SECRET = os.environ.get(
     "OIDC_CLIENT_SECRET", "react-login-dev-secret-do-not-use-in-prod"
 )
+
+# Optional multi-client registry so one running instance can serve more than one
+# confidential client. JSON object keyed by redirect_uri:
+#   {"http://localhost:5173/callback": {"client_id": "...", "client_secret": "..."}}
+# The incoming request carries no client_id (the payload is just code +
+# code_verifier + redirect_uri), so the client is resolved by redirect_uri.
+# Falls back to OIDC_CLIENT_ID / OIDC_CLIENT_SECRET when a redirect_uri is not
+# registered (or the registry is unset).
+_CLIENT_REGISTRY: dict[str, dict[str, str]] = json.loads(
+    os.environ.get("OIDC_TOKEN_CLIENTS", "{}")
+)
+
+
+def _resolve_client(redirect_uri: str | None) -> tuple[str, str]:
+    entry = _CLIENT_REGISTRY.get(redirect_uri or "")
+    if entry:
+        return entry["client_id"], entry["client_secret"]
+    return OIDC_CLIENT_ID, OIDC_CLIENT_SECRET
 
 _jwks_client = PyJWKClient(OIDC_JWKS_URL)
 
@@ -33,7 +52,7 @@ app = FastAPI(title="decode-service")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -75,19 +94,45 @@ def decode_token(payload: DecodeRequest) -> dict:
 
 @app.post("/token")
 async def confidential_token(request: Request) -> Response:
-    """Confidential token-exchange proxy. Accepts the same form-urlencoded
-    authorization_code body an OAuth2 token endpoint does (as sent by
-    request-oauth2's exchangeCodeForToken), injects client_id + client_secret
-    server-side, forwards to OIDC_TOKEN_URL, and on success also decodes the
-    id_token (same logic as POST /decode). Returns the token response plus a
-    `claims` object; passes an upstream OAuth2 error + status straight through."""
-    # The body is always application/x-www-form-urlencoded (as sent by
-    # exchangeCodeForToken); parse it directly to avoid a python-multipart dep.
-    incoming = dict(parse_qsl((await request.body()).decode()))
+    """Confidential token-exchange proxy. Injects client_id + client_secret
+    server-side, forwards the authorization_code grant to OIDC_TOKEN_URL, and on
+    success also decodes the id_token (same logic as POST /decode). Returns the
+    token response plus a `claims` object; passes an upstream OAuth2 error +
+    status straight through.
+
+    Accepts two body shapes:
+      - application/json: {"code", "code_verifier", "redirect_uri"} — as sent by
+        request-oauth2's exchangeCodeForTokenViaBackend. No grant_type/client_id.
+      - application/x-www-form-urlencoded: the full authorization_code body an
+        OAuth2 token endpoint takes — as sent by request-oauth2's plain
+        exchangeCodeForToken pointed here.
+    The confidential client is resolved from redirect_uri (see _CLIENT_REGISTRY)."""
+    ctype = request.headers.get("content-type", "")
+    if ctype.startswith("application/json"):
+        try:
+            incoming = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise HTTPException(status_code=400, detail="Malformed JSON body")
+    else:
+        # Parsed directly to avoid a python-multipart dependency.
+        incoming = dict(parse_qsl((await request.body()).decode()))
+
+    if not isinstance(incoming, dict) or not all(
+        incoming.get(k) for k in ("code", "code_verifier", "redirect_uri")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="code, code_verifier and redirect_uri are required",
+        )
+
+    client_id, client_secret = _resolve_client(incoming.get("redirect_uri"))
     form = {
-        **incoming,  # grant_type, redirect_uri, code, code_verifier
-        "client_id": OIDC_CLIENT_ID,  # pin to the confidential client
-        "client_secret": OIDC_CLIENT_SECRET,
+        "grant_type": incoming.get("grant_type", "authorization_code"),
+        "code": incoming["code"],
+        "code_verifier": incoming["code_verifier"],
+        "redirect_uri": incoming["redirect_uri"],
+        "client_id": client_id,  # pinned server-side, ignoring any inbound value
+        "client_secret": client_secret,
     }
 
     async with httpx.AsyncClient(timeout=10) as http:
